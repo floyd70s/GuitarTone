@@ -4,17 +4,36 @@ import { Pedal, Amplifier, Cabinet, GearType } from '../types';
 class AudioEngine {
   private ctx: AudioContext | null = null;
   private input: MediaStreamAudioSourceNode | null = null;
-  private nodes: AudioNode[] = [];
+  private nodes: Map<string, AudioNode> = new Map();
   private analyser: AnalyserNode | null = null;
   private isMonitoring = false;
+  private masterGain: GainNode | null = null;
 
   async init() {
     if (this.ctx) return;
-    this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    this.input = this.ctx.createMediaStreamSource(stream);
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 256;
+    
+    this.ctx = new (window.AudioContext || (window as any).webkitAudioContext)({
+      latencyHint: 'interactive',
+      sampleRate: 44100
+    });
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: { 
+          echoCancellation: false, 
+          noiseSuppression: false, 
+          autoGainControl: false
+        } 
+      });
+      this.input = this.ctx.createMediaStreamSource(stream);
+      this.analyser = this.ctx.createAnalyser();
+      this.analyser.fftSize = 256;
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = 0;
+      this.masterGain.connect(this.ctx.destination);
+    } catch (e) {
+      console.error("Microphone access denied", e);
+    }
   }
 
   getAnalyser() {
@@ -23,7 +42,12 @@ class AudioEngine {
 
   setMonitoring(on: boolean) {
     this.isMonitoring = on;
-    this.rebuildGraph([], null, null);
+    if (this.masterGain && this.ctx) {
+      this.masterGain.gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.02);
+    }
+    if (on && this.ctx?.state === 'suspended') {
+      this.ctx.resume();
+    }
   }
 
   private createDistortionCurve(amount: number) {
@@ -38,125 +62,156 @@ class AudioEngine {
     return curve;
   }
 
+  updateParams(pedals: Pedal[], amp: Amplifier | null) {
+    if (!this.ctx) return;
+    
+    const time = this.ctx.currentTime;
+
+    pedals.forEach(p => {
+      const driveVal = p.knobs.find(k => k.label.toLowerCase().includes('drive') || k.label.toLowerCase().includes('gain'))?.value || 5;
+      const levelVal = p.knobs.find(k => k.label.toLowerCase().includes('level') || k.label.toLowerCase().includes('output'))?.value || 5;
+      const toneVal = p.knobs.find(k => k.label.toLowerCase().includes('tone'))?.value || 5;
+
+      // Handle Bypass (Dry/Wet)
+      const dryGain = this.nodes.get(`${p.id}-dry`) as GainNode;
+      const wetGain = this.nodes.get(`${p.id}-wet`) as GainNode;
+      
+      if (dryGain && wetGain) {
+        dryGain.gain.setTargetAtTime(p.isActive ? 0 : 1, time, 0.02);
+        wetGain.gain.setTargetAtTime(p.isActive ? 1 : 0, time, 0.02);
+      }
+
+      // Handle parameters
+      const driveNode = this.nodes.get(`${p.id}-drive`) as GainNode;
+      if (driveNode) driveNode.gain.setTargetAtTime((driveVal / 10) * 3 + 1, time, 0.02);
+
+      const toneNode = this.nodes.get(`${p.id}-tone-filter`) as BiquadFilterNode;
+      if (toneNode) toneNode.frequency.setTargetAtTime(500 + (toneVal * 2000), time, 0.02);
+
+      const outNode = this.nodes.get(`${p.id}-out`) as GainNode;
+      if (outNode) outNode.gain.setTargetAtTime(levelVal / 5, time, 0.02);
+    });
+
+    if (amp) {
+      const gainVal = amp.knobs.find(k => k.label.toLowerCase().includes('gain'))?.value || 5;
+      const preampNode = this.nodes.get(`amp-preamp`) as GainNode;
+      if (preampNode) preampNode.gain.setTargetAtTime(gainVal * 2, time, 0.02);
+
+      const bassVal = amp.knobs.find(k => k.label === 'Bass')?.value || 5;
+      const midVal = amp.knobs.find(k => k.label === 'Middle' || k.label === 'Mid')?.value || 5;
+      const trebVal = amp.knobs.find(k => k.label === 'Treble')?.value || 5;
+
+      const bassNode = this.nodes.get(`amp-bass`) as BiquadFilterNode;
+      if (bassNode) bassNode.gain.setTargetAtTime(bassVal * 2 - 10, time, 0.02);
+      
+      const midNode = this.nodes.get(`amp-mid`) as BiquadFilterNode;
+      if (midNode) midNode.gain.setTargetAtTime(midVal * 2 - 10, time, 0.02);
+
+      const trebNode = this.nodes.get(`amp-treb`) as BiquadFilterNode;
+      if (trebNode) trebNode.gain.setTargetAtTime(trebVal * 2 - 10, time, 0.02);
+    }
+  }
+
   rebuildGraph(pedals: Pedal[], amp: Amplifier | null, cab: Cabinet | null) {
-    if (!this.ctx || !this.input || !this.analyser) return;
+    if (!this.ctx || !this.input || !this.analyser || !this.masterGain) return;
 
     this.nodes.forEach(n => {
       try { n.disconnect(); } catch(e) {}
     });
-    this.nodes = [];
+    this.nodes.clear();
 
     let lastNode: AudioNode = this.input;
 
-    // Pedals chain (reverse order from flex-row-reverse in UI)
+    // Build pedal chain with dry/wet routing for true bypass without rebuilding
     const activeChain = [...pedals].reverse();
 
     activeChain.forEach(p => {
-      if (p.isActive === false) return;
+      const pedalInput = lastNode;
+      const pedalOutput = this.ctx!.createGain();
+      
+      const dryPath = this.ctx!.createGain();
+      const wetPath = this.ctx!.createGain();
+      
+      // Effect nodes (simplified drive model)
+      const driveGain = this.ctx!.createGain();
+      const shaper = this.ctx!.createWaveShaper();
+      const toneFilter = this.ctx!.createBiquadFilter();
+      const postGain = this.ctx!.createGain();
 
-      if (p.type === GearType.DRIVE) {
-        const gain = this.ctx!.createGain();
-        const driveVal = p.knobs.find(k => k.label.toLowerCase().includes('drive') || k.label.toLowerCase().includes('gain'))?.value || 5;
-        gain.gain.value = driveVal * 2;
-        
-        const shaper = this.ctx!.createWaveShaper();
-        shaper.curve = this.createDistortionCurve(driveVal);
-        shaper.oversample = '4x';
+      shaper.curve = this.createDistortionCurve(5);
+      shaper.oversample = '4x';
+      toneFilter.type = 'lowpass';
 
-        const filter = this.ctx!.createBiquadFilter();
-        const toneVal = p.knobs.find(k => k.label.toLowerCase().includes('tone'))?.value || 5;
-        filter.type = 'lowpass';
-        filter.frequency.value = 500 + (toneVal * 1000);
+      // Routing
+      pedalInput.connect(dryPath);
+      dryPath.connect(pedalOutput);
 
-        lastNode.connect(gain);
-        gain.connect(shaper);
-        shaper.connect(filter);
-        lastNode = filter;
-        this.nodes.push(gain, shaper, filter);
-      }
+      pedalInput.connect(driveGain);
+      driveGain.connect(shaper);
+      shaper.connect(toneFilter);
+      toneFilter.connect(postGain);
+      postGain.connect(wetPath);
+      wetPath.connect(pedalOutput);
 
-      if (p.type === GearType.DELAY) {
-        const delay = this.ctx!.createDelay(5.0);
-        const time = p.knobs.find(k => k.label.toLowerCase().includes('time') || k.label.toLowerCase().includes('delay'))?.value || 5;
-        delay.delayTime.value = (time / 10) * 0.8;
+      this.nodes.set(`${p.id}-dry`, dryPath);
+      this.nodes.set(`${p.id}-wet`, wetPath);
+      this.nodes.set(`${p.id}-drive`, driveGain);
+      this.nodes.set(`${p.id}-tone-filter`, toneFilter);
+      this.nodes.set(`${p.id}-out`, postGain);
 
-        const feedback = this.ctx!.createGain();
-        const fbVal = p.knobs.find(k => k.label.toLowerCase().includes('back') || k.label.toLowerCase().includes('regen'))?.value || 5;
-        feedback.gain.value = (fbVal / 10) * 0.6;
-
-        const mix = this.ctx!.createGain();
-        const mixVal = p.knobs.find(k => k.label.toLowerCase().includes('mix') || k.label.toLowerCase().includes('level'))?.value || 5;
-        mix.gain.value = (mixVal / 10);
-
-        lastNode.connect(delay);
-        delay.connect(feedback);
-        feedback.connect(delay);
-        delay.connect(mix);
-        
-        const merger = this.ctx!.createGain();
-        lastNode.connect(merger);
-        mix.connect(merger);
-        lastNode = merger;
-        this.nodes.push(delay, feedback, mix, merger);
-      }
+      lastNode = pedalOutput;
     });
 
-    // Amplifier
     if (amp) {
-      const preampGain = this.ctx.createGain();
-      const gainVal = amp.knobs.find(k => k.label.toLowerCase().includes('gain') || k.label.toLowerCase().includes('vol'))?.value || 5;
-      preampGain.gain.value = gainVal * 3;
+      const preamp = this.ctx.createGain();
+      const shaper = this.ctx.createWaveShaper();
+      shaper.curve = this.createDistortionCurve(2);
 
-      const toneStackBass = this.ctx.createBiquadFilter();
-      toneStackBass.type = 'lowshelf';
-      toneStackBass.frequency.value = 150;
-      toneStackBass.gain.value = (amp.knobs.find(k => k.label === 'Bass')?.value || 5) * 2 - 10;
+      const bass = this.ctx.createBiquadFilter();
+      bass.type = 'lowshelf';
+      bass.frequency.value = 150;
 
-      const toneStackMid = this.ctx.createBiquadFilter();
-      toneStackMid.type = 'peaking';
-      toneStackMid.frequency.value = 800;
-      toneStackMid.gain.value = (amp.knobs.find(k => k.label === 'Middle' || k.label === 'Mid')?.value || 5) * 2 - 10;
+      const mid = this.ctx.createBiquadFilter();
+      mid.type = 'peaking';
+      mid.frequency.value = 800;
 
-      const toneStackTreble = this.ctx.createBiquadFilter();
-      toneStackTreble.type = 'highshelf';
-      toneStackTreble.frequency.value = 3000;
-      toneStackTreble.gain.value = (amp.knobs.find(k => k.label === 'Treble')?.value || 5) * 2 - 10;
+      const treb = this.ctx.createBiquadFilter();
+      treb.type = 'highshelf';
+      treb.frequency.value = 3000;
 
-      const ampSim = this.ctx.createWaveShaper();
-      ampSim.curve = this.createDistortionCurve(gainVal * 0.5);
-
-      lastNode.connect(preampGain);
-      preampGain.connect(ampSim);
-      ampSim.connect(toneStackBass);
-      toneStackBass.connect(toneStackMid);
-      toneStackMid.connect(toneStackTreble);
-      lastNode = toneStackTreble;
-      this.nodes.push(preampGain, ampSim, toneStackBass, toneStackMid, toneStackTreble);
+      lastNode.connect(preamp);
+      preamp.connect(shaper);
+      shaper.connect(bass);
+      bass.connect(mid);
+      mid.connect(treb);
+      
+      this.nodes.set(`amp-preamp`, preamp);
+      this.nodes.set(`amp-bass`, bass);
+      this.nodes.set(`amp-mid`, mid);
+      this.nodes.set(`amp-treb`, treb);
+      
+      lastNode = treb;
     }
 
-    // Cabinet
     if (cab) {
-      const cabFilter = this.ctx.createBiquadFilter();
-      cabFilter.type = 'lowpass';
-      // Most guitar speakers roll off sharply after 5-6kHz
-      cabFilter.frequency.value = 5500;
-      
-      const cabHump = this.ctx.createBiquadFilter();
-      cabHump.type = 'peaking';
-      cabHump.frequency.value = 100;
-      cabHump.gain.value = 6;
+      const lowCut = this.ctx.createBiquadFilter();
+      lowCut.type = 'highpass';
+      lowCut.frequency.value = 80;
 
-      lastNode.connect(cabHump);
-      cabHump.connect(cabFilter);
-      lastNode = cabFilter;
-      this.nodes.push(cabHump, cabFilter);
+      const highCut = this.ctx.createBiquadFilter();
+      highCut.type = 'lowpass';
+      highCut.frequency.value = 5500;
+
+      lastNode.connect(lowCut);
+      lowCut.connect(highCut);
+      lastNode = highCut;
     }
 
     lastNode.connect(this.analyser);
+    this.analyser.connect(this.masterGain);
     
-    if (this.isMonitoring) {
-      this.analyser.connect(this.ctx.destination);
-    }
+    // Initial parameter sync
+    this.updateParams(pedals, amp);
   }
 }
 

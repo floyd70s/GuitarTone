@@ -46,9 +46,21 @@ const App: React.FC = () => {
     }
   }, []);
 
+  // Structural changes trigger full graph rebuild
+  // We only include length and IDs to avoid rebuilding on simple knob/bypass changes
   useEffect(() => {
     audioEngine.rebuildGraph(currentPedals, currentAmp, currentCab);
-  }, [currentPedals, currentAmp, currentCab]);
+  }, [
+    currentPedals.length, 
+    currentAmp?.id, 
+    currentCab?.id, 
+    currentPedals.map(p => p.id).join('-')
+  ]);
+
+  // Pure parameter updates (knob moves OR bypass toggles) handled via setTargetAtTime
+  useEffect(() => {
+    audioEngine.updateParams(currentPedals, currentAmp);
+  }, [currentPedals, currentAmp]);
 
   useEffect(() => {
     if (!isMonitoring) return;
@@ -58,7 +70,7 @@ const App: React.FC = () => {
       const analyser = audioEngine.getAnalyser();
       if (analyser) {
         analyser.getByteFrequencyData(dataArray);
-        const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+        const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
         setAudioLevel(average / 128);
       }
       frame = requestAnimationFrame(update);
@@ -76,11 +88,25 @@ const App: React.FC = () => {
     audioEngine.setMonitoring(newState);
   };
 
-  const clearRig = () => {
-    if (window.confirm("Clear the board and start over?")) {
+  const resetAll = () => {
+    if (window.confirm("Return to start and reset entire setup?")) {
       setCurrentPedals([]);
+      setCurrentAmp(null);
+      setCurrentCab(CABINET_LIBRARY[0]);
       setRigName('My Custom Rig');
       setSongInfo(null);
+      setSearchQuery('');
+      setIsOnboarding(true);
+      audioEngine.rebuildGraph([], null, CABINET_LIBRARY[0]);
+    }
+  };
+
+  const clearBoard = () => {
+    if (window.confirm("Clear all pedals from the board?")) {
+      setCurrentPedals([]);
+      setSongInfo(null);
+      setSearchQuery('');
+      audioEngine.rebuildGraph([], currentAmp, currentCab);
     }
   };
 
@@ -309,7 +335,10 @@ const App: React.FC = () => {
       <input type="file" ref={fileInputRef} className="hidden" accept=".json" onChange={importSongFromJson} />
 
       <header className="bg-slate-900/80 backdrop-blur-xl border-b border-white/5 px-6 py-3 z-[100] flex items-center justify-between shrink-0 shadow-2xl">
-        <div className="flex items-center gap-4 cursor-pointer group" onClick={() => setIsOnboarding(true)}>
+        <div 
+          className="flex items-center gap-4 cursor-pointer group" 
+          onClick={resetAll}
+        >
           <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center font-black shadow-[0_0_20px_rgba(37,99,235,0.4)] group-hover:scale-110 transition-transform">GT</div>
           <h1 className="text-2xl font-black italic tracking-tighter hidden lg:block">GUITAR TONE</h1>
         </div>
@@ -329,7 +358,6 @@ const App: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-3">
-           {/* Monitor Toggle */}
            <button onClick={toggleMonitoring} className={`flex items-center gap-2 px-4 py-2 rounded-xl border transition-all ${isMonitoring ? 'bg-red-600/20 text-red-400 border-red-500/50' : 'bg-slate-800 text-slate-400 border-white/5'}`}>
              <div className={`w-3 h-3 rounded-full ${isMonitoring ? 'bg-red-500 animate-pulse shadow-[0_0_10px_red]' : 'bg-slate-600'}`} />
              <span className="text-[10px] font-black uppercase tracking-widest">{isMonitoring ? 'Live' : 'Connect'}</span>
@@ -348,7 +376,7 @@ const App: React.FC = () => {
            <button onClick={() => fileInputRef.current?.click()} title="Import Song Config" className="w-11 h-11 bg-amber-600/10 text-amber-400 hover:bg-amber-600/20 rounded-2xl transition-all active:scale-90 border border-amber-500/20 flex items-center justify-center">
              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0l-4-4m4-4v12"/></svg>
            </button>
-           <button onClick={clearRig} title="Clear Board" className="w-11 h-11 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-2xl transition-all active:scale-90 border border-red-500/20 flex items-center justify-center">
+           <button onClick={clearBoard} title="Clear Board" className="w-11 h-11 bg-red-600/10 text-red-400 hover:bg-red-600/20 rounded-2xl transition-all active:scale-90 border border-red-500/20 flex items-center justify-center">
              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
            </button>
            <div className="w-[1px] h-8 bg-white/5 mx-1" />
@@ -362,7 +390,6 @@ const App: React.FC = () => {
           
           <div className="w-full max-w-[1400px] relative flex flex-col items-center justify-center flex-[1.2] overflow-visible">
             
-            {/* Audio Level Indicator */}
             {isMonitoring && (
               <div className="absolute left-8 top-1/2 -translate-y-1/2 flex flex-col items-center gap-2">
                 <div className="w-2 h-48 bg-zinc-900 rounded-full overflow-hidden flex flex-col justify-end">
@@ -430,7 +457,6 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {/* Cabinet Visual */}
             {currentCab && (
               <div 
                 onClick={() => { setActiveCategory(GearType.CABINET); setShowGearMenu(true); }}
@@ -504,6 +530,10 @@ const App: React.FC = () => {
           </div>
         )}
       </main>
+
+      <footer className="bg-black/98 p-2 text-center text-zinc-900 text-[10px] font-black uppercase tracking-[1.5em] select-none shrink-0 border-t border-white/[0.02]">
+        Neural Guitar Rig Core Emulator
+      </footer>
 
       {showGearMenu && (
         <div className="fixed inset-0 bg-black/90 backdrop-blur-3xl z-[200] flex items-center justify-center p-8">

@@ -1,0 +1,7 @@
+{
+  "name": "Guitar Tone",
+  "description": "Virtual guitar rig emulator. Build your pedalboard and use AI to match the tone of any song.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
